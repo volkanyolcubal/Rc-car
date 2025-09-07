@@ -1,0 +1,324 @@
+import sys
+import serial
+import serial.tools.list_ports
+from PyQt5 import QtWidgets, QtGui, QtCore
+import time
+import pygame
+import pyttsx3
+import threading
+
+# RC Araba komutları
+# Arduino kodunda bu komutlara göre motorları kontrol etmelisiniz.
+# 'F': İleri git
+# 'S': Dur
+# 'B': Geri git
+# 'L': Sola dön
+# 'R': Sağa dön
+
+class UgiThreadClass(QtCore.QThread):
+    """
+    Pygame animasyonunu ve pyttsx3 sesini yöneten ayrı bir iş parçacığı.
+    """
+    # Ana arayüzden gelen konuşma metnini almak için bir sinyal
+    speak_signal = QtCore.pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super(UgiThreadClass, self).__init__(parent)
+        self.talking = False
+        self.wink = False
+        self.last_wink_time = time.time()
+        self.mouth_state = 0
+        self.running = True
+
+        # pyttsx3 motorunu başlat
+        self.engine = pyttsx3.init()
+        self.engine.setProperty('rate', 150)  # Konuşma hızını ayarla
+
+        # Pygame başlatma ve pencere oluşturma
+        pygame.init()
+        self.screen = pygame.display.set_mode((400, 400), pygame.NOFRAME) # Çerçevesiz pencere
+        pygame.display.set_caption("Ugi Asistan")
+        
+        # Renkler
+        self.WHITE = (255, 255, 255)
+        self.BLACK = (0, 0, 0)
+        self.GREEN = (0, 255, 0)
+        
+        # Sinyali işleyecek fonksiyonu bağla
+        self.speak_signal.connect(self.speak_text)
+
+    def speak_text(self, text):
+        """Metni sesli olarak okur."""
+        self.talking = True
+        self.engine.say(text)
+        self.engine.runAndWait()
+        self.talking = False
+
+    def draw_ugi(self):
+        """Ugi'nin yüzünü çizer."""
+        self.screen.fill(self.WHITE)
+
+        # Gri yüz çerçevesi
+        pygame.draw.circle(self.screen, (200, 200, 200), (200, 200), 120)
+
+        # Siyah ekran kısmı (yüz)
+        pygame.draw.rect(self.screen, self.BLACK, (110, 130, 180, 150), border_radius=30)
+
+        # Gözler
+        if not self.wink:
+            pygame.draw.circle(self.screen, self.GREEN, (155, 180), 18)
+            pygame.draw.circle(self.screen, self.GREEN, (245, 180), 18)
+            pygame.draw.circle(self.screen, self.BLACK, (155, 180), 8)
+            pygame.draw.circle(self.screen, self.BLACK, (245, 180), 8)
+        else:
+            pygame.draw.line(self.screen, self.GREEN, (145, 180), (165, 180), 5)
+            pygame.draw.line(self.screen, self.GREEN, (235, 180), (255, 180), 5)
+
+        # Ağız (3 pozisyonlu)
+        if self.mouth_state == 0:
+            pygame.draw.arc(self.screen, self.GREEN, (172, 220, 50, 25), 3.14, 0, 2)
+        elif self.mouth_state == 1:
+            pygame.draw.arc(self.screen, self.GREEN, (170, 225, 55, 30), 3.14, 0, 4)
+        else:
+            pygame.draw.arc(self.screen, self.GREEN, (168, 230, 60, 35), 3.14, 0, 6)
+
+        pygame.display.update()
+
+    def run(self):
+        """Pygame ana döngüsü."""
+        # Ugi ilk mesajı söylesin
+        self.speak_signal.emit("Merhaba ben Ugi! RC araba için hazırım!")
+        
+        while self.running:
+            current_time = time.time()
+            
+            # Göz kırpma animasyonu
+            if current_time - self.last_wink_time > 3:
+                self.wink = not self.wink
+                self.last_wink_time = current_time
+
+            # Ağız animasyonu konuşmaya bağlı
+            if self.talking:
+                self.mouth_state = (self.mouth_state + 1) % 3
+            else:
+                self.mouth_state = 0
+
+            self.draw_ugi()
+
+            # Pygame olaylarını kontrol et
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.running = False
+            
+            time.sleep(0.1)
+        
+        pygame.quit()
+
+
+class SerialThreadClass(QtCore.QThread):
+    """
+    Seri porttan veri okumak için ayrı bir iş parçacığı.
+    """
+    message = QtCore.pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super(SerialThreadClass, self).__init__(parent)
+        self.serialPort = serial.Serial()
+        self.stopflag = False
+
+    def stop(self):
+        self.stopflag = True
+
+    def run(self):
+        while True:
+            if self.stopflag:
+                self.stopflag = False
+                break
+            elif self.serialPort.isOpen():
+                try:
+                    data = self.serialPort.readline()
+                    self.message.emit(data.decode('utf-8').strip())
+                except Exception as e:
+                    print(f"Seri port okuma hatası: {e}")
+                    pass
+
+class Pencere(QtWidgets.QWidget):
+    """
+    Ana arayüz sınıfı (PyQt5). Seri port ve AI kontrolünü yönetir.
+    """
+    def __init__(self):
+        super().__init__()
+        self.obstacle_threshold_cm = 30
+        self.initUi()
+
+    def initUi(self):
+        # UI bileşenleri
+        self.portComboBox = QtWidgets.QComboBox()
+        self.ports = serial.tools.list_ports.comports()
+        for i in self.ports:
+            self.portComboBox.addItem(str(i))
+
+        self.baudComboBox = QtWidgets.QComboBox()
+        baud = ["9600", "115200", "57600"]
+        for i in baud:
+            self.baudComboBox.addItem(i)
+        self.baudComboBox.setCurrentText("9600")
+
+        self.connect_button = QtWidgets.QPushButton("Bağlan")
+        self.disconnect_button = QtWidgets.QPushButton("Bağlantıyı Kes")
+        self.status_label = QtWidgets.QLabel('<font color=red>COM port bağlı değil!</font>')
+
+        portVbox = QtWidgets.QVBoxLayout()
+        portVbox.addWidget(self.portComboBox)
+        portVbox.addWidget(self.baudComboBox)
+        portVbox.addWidget(self.connect_button)
+        portVbox.addWidget(self.disconnect_button)
+        portVbox.addWidget(self.status_label)
+
+        self.portGroup = QtWidgets.QGroupBox("Port Seçme")
+        self.portGroup.setLayout(portVbox)
+
+        self.status_text_edit = QtWidgets.QTextEdit()
+        self.status_text_edit.setReadOnly(True)
+        self.status_text_edit.setMinimumHeight(200)
+        self.status_title = QtWidgets.QLabel("Yapay Zeka Durumu ve Gelen Veri")
+        self.status_title.setFont(QtGui.QFont("Arial", 12, QtGui.QFont.Bold))
+
+        vBox = QtWidgets.QVBoxLayout()
+        vBox.addStretch()
+        vBox.addWidget(self.portGroup)
+        vBox.addWidget(self.status_title)
+        vBox.addWidget(self.status_text_edit)
+        vBox.addStretch()
+
+        hBox = QtWidgets.QHBoxLayout()
+        hBox.addStretch()
+        hBox.addLayout(vBox)
+        hBox.addStretch()
+
+        self.setLayout(hBox)
+        self.setWindowTitle("AI Kontrollü RC Araba")
+        
+        # İş parçacıklarını başlat
+        self.mySerial = SerialThreadClass()
+        self.mySerial.message.connect(self.handle_serial_data)
+        self.mySerial.start()
+        
+        self.ugiThread = UgiThreadClass()
+        self.ugiThread.start()
+
+        # Buton bağlantıları
+        self.connect_button.clicked.connect(self.serialConnect)
+        self.disconnect_button.clicked.connect(self.serialDisconnect)
+        self.show()
+
+    def serialConnect(self):
+        """Bağlan butonuna tıklandığında seri port bağlantısını kurar."""
+        try:
+            port_text = self.portComboBox.currentText()
+            port = port_text.split()[0]
+            baudrate = int(self.baudComboBox.currentText())
+
+            self.mySerial.serialPort.baudrate = baudrate
+            self.mySerial.serialPort.port = port
+            self.mySerial.serialPort.open()
+
+            self.status_label.setText('<font color=green>Bağlandı</font>')
+            self.connect_button.setEnabled(False)
+            self.portComboBox.setEnabled(False)
+            self.baudComboBox.setEnabled(False)
+            
+            message = f"Seri porta başarıyla bağlandı: {port} @ {baudrate}"
+            self.status_text_edit.append(message)
+            self.ugiThread.speak_signal.emit(message)
+
+        except Exception as e:
+            message = f"Bağlantı Hatası: {e}"
+            self.status_text_edit.append(message)
+            self.ugiThread.speak_signal.emit(message)
+
+    def serialDisconnect(self):
+        """Bağlantı Kes butonuna tıklandığında seri port bağlantısını sonlandırır."""
+        if self.mySerial.serialPort.isOpen():
+            self.mySerial.serialPort.close()
+            if not self.mySerial.serialPort.isOpen():
+                self.status_label.setText('<font color=red>Bağlantı Kesildi</font>')
+                self.connect_button.setEnabled(True)
+                self.portComboBox.setEnabled(True)
+                self.baudComboBox.setEnabled(True)
+                message = "Seri bağlantı kesildi."
+                self.status_text_edit.append(message)
+                self.ugiThread.speak_signal.emit(message)
+        else:
+            self.status_text_edit.append("Seri port zaten kapalı.")
+
+    def send_command(self, command):
+        """Seri port üzerinden Arduino'ya komut gönderir."""
+        if self.mySerial.serialPort.isOpen():
+            self.mySerial.serialPort.write(command.encode('utf-8'))
+        else:
+            self.status_text_edit.append("Seri Port Bağlı Değil. Komut gönderilemedi.")
+
+    def handle_serial_data(self, data):
+        """
+        Seri porttan gelen veriyi işleyen ana Yapay Zeka mantığı.
+        """
+        try:
+            distance = int(data)
+            
+            # Gelen veriyi ve mevcut durumu ekrana yazdır.
+            self.status_text_edit.append(f"Mesafe: {distance} cm")
+
+            # Yapay zeka algoritması: Gelen mesafeye göre karar ver.
+            if distance < self.obstacle_threshold_cm:
+                # Engel algılandı
+                message = "Engel tespit edildi. Manevra başlıyor!"
+                self.status_text_edit.append(message)
+                self.ugiThread.speak_signal.emit(message)
+                
+                # Durma komutu gönder
+                self.send_command('S')
+                message = "Araba durdu."
+                self.status_text_edit.append(message)
+                self.ugiThread.speak_signal.emit(message)
+                time.sleep(1) # Durması için 1 saniye bekle
+
+                # Geri gitme komutu gönder
+                self.send_command('B')
+                message = "Geriye doğru gidiyorum."
+                self.status_text_edit.append(message)
+                self.ugiThread.speak_signal.emit(message)
+                time.sleep(1.5)
+
+                # Tekrar dur komutu gönder
+                self.send_command('S')
+                message = "Durdu."
+                self.status_text_edit.append(message)
+                self.ugiThread.speak_signal.emit(message)
+                time.sleep(1)
+
+                # Yön değiştirme
+                self.send_command('R')
+                message = "Sağa dönerek engelden kaçıyorum."
+                self.status_text_edit.append(message)
+                self.ugiThread.speak_signal.emit(message)
+                time.sleep(1)
+
+                message = "Engelden kaçış manevrası tamamlandı."
+                self.status_text_edit.append(message)
+                self.ugiThread.speak_signal.emit(message)
+            else:
+                # Engel yok, ileri gitmeye devam et
+                self.send_command('F')
+                message = "Yol açık, ileri gidiyorum."
+                self.status_text_edit.append(message)
+                self.ugiThread.speak_signal.emit(message)
+
+        except ValueError:
+            # Gelen veri sayısal değilse
+            self.status_text_edit.append(f"Gelen veri: {data}")
+
+if __name__ == '__main__':
+    app = QtWidgets.QApplication(sys.argv)
+    pen = Pencere()
+    sys.exit(app.exec_())
